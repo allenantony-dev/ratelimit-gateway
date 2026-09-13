@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 )
 
 // Concurrent requests to fire; override as `go run client/main.go 1000`.
@@ -29,25 +30,34 @@ func main() {
 	tr.MaxIdleConnsPerHost = requests
 	http.DefaultClient.Transport = tr
 
+	var ok, rejected, failed atomic.Int64
 	var wg sync.WaitGroup
 
-	for i := range requests {
+	for range requests {
 		wg.Add(1)
 
-		go func(id int) {
+		go func() {
 			defer wg.Done()
 
 			resp, err := http.Get("http://127.0.0.1:8080/hello")
 			if err != nil {
-				// Don't log.Fatal: one failure must not stop the load.
-				log.Println("request", id, "failed:", err)
+				failed.Add(1)
 				return
 			}
 			defer resp.Body.Close()
-
 			io.Copy(io.Discard, resp.Body)
-		}(i)
+
+			switch resp.StatusCode {
+			case http.StatusOK:
+				ok.Add(1)
+			case http.StatusServiceUnavailable:
+				rejected.Add(1)
+			default:
+				failed.Add(1)
+			}
+		}()
 	}
 
 	wg.Wait()
+	log.Printf("ok=%d rejected(503)=%d failed=%d", ok.Load(), rejected.Load(), failed.Load())
 }
