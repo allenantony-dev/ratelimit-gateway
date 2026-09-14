@@ -6,27 +6,63 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"time"
 )
 
 const maxInFlight = 100
 
 var sem = make(chan struct{}, maxInFlight)
 
-// Log each source IP only the first time it's seen, so identifying clients
-// costs one line per client instead of one per request.
-var (
-	seenMu sync.Mutex
-	seen   = map[string]bool{}
+const (
+	rateLimit = 10
+	window    = time.Minute
 )
+
+// Per-client fixed-window limit, keyed by source IP: at most rateLimit requests
+// per window. Simplest shape; its flaw is the boundary -- a client can send
+// rateLimit at the end of one window and rateLimit at the start of the next,
+// up to 2*rateLimit in a short span. A token bucket or sliding window smooths
+// that at the cost of more code.
+type counter struct {
+	windowStart time.Time
+	count       int
+}
+
+var (
+	mu       sync.Mutex
+	counters = map[string]*counter{}
+)
+
+// allow records one arrival from ip and reports whether it's within the limit.
+func allow(ip string) bool {
+	now := time.Now()
+	mu.Lock()
+	defer mu.Unlock()
+
+	c := counters[ip]
+	if c == nil {
+		log.Println("first request from", ip)
+		counters[ip] = &counter{windowStart: now, count: 1}
+		return true
+	}
+	if now.Sub(c.windowStart) >= window {
+		c.windowStart = now
+		c.count = 1
+		return true
+	}
+	if c.count >= rateLimit {
+		return false
+	}
+	c.count++
+	return true
+}
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	seenMu.Lock()
-	if !seen[host] {
-		seen[host] = true
-		log.Println("first request from", host)
+	if !allow(host) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
 	}
-	seenMu.Unlock()
 
 	// Non-blocking acquire: reject when all slots are taken, don't queue.
 	select {

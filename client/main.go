@@ -46,7 +46,7 @@ func main() {
 
 	log.Printf("firing %d concurrent requests (from %q) at http://127.0.0.1:8080/hello", requests, *from)
 
-	var ok, rejected, failed atomic.Int64
+	var ok, limited, overloaded, failed atomic.Int64
 	var wg sync.WaitGroup
 
 	for range requests {
@@ -66,8 +66,10 @@ func main() {
 			switch resp.StatusCode {
 			case http.StatusOK:
 				ok.Add(1)
+			case http.StatusTooManyRequests:
+				limited.Add(1)
 			case http.StatusServiceUnavailable:
-				rejected.Add(1)
+				overloaded.Add(1)
 			default:
 				failed.Add(1)
 			}
@@ -75,5 +77,6 @@ func main() {
 	}
 
 	wg.Wait()
-	log.Printf("ok=%d rejected(503)=%d failed=%d", ok.Load(), rejected.Load(), failed.Load())
+	log.Printf("ok=%d rate-limited(429)=%d overloaded(503)=%d failed=%d",
+		ok.Load(), limited.Load(), overloaded.Load(), failed.Load())
 }
