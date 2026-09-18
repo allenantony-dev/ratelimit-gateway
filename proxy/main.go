@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -33,8 +34,24 @@ var (
 	counters = map[string]*counter{}
 )
 
-// allow records one arrival from ip and reports whether it's within the limit.
-func allow(ip string) bool {
+// limitState is a snapshot of one client's quota, taken under the lock so the
+// handler can set rate-limit headers without racing on the map.
+type limitState struct {
+	allowed   bool
+	remaining int
+	resetIn   time.Duration
+}
+
+func snapshot(c *counter, now time.Time, allowed bool) limitState {
+	remaining := rateLimit - c.count
+	if remaining < 0 {
+		remaining = 0
+	}
+	return limitState{allowed: allowed, remaining: remaining, resetIn: window - now.Sub(c.windowStart)}
+}
+
+// allow records one arrival from ip and returns the resulting quota snapshot.
+func allow(ip string) limitState {
 	now := time.Now()
 	mu.Lock()
 	defer mu.Unlock()
@@ -42,26 +59,45 @@ func allow(ip string) bool {
 	c := counters[ip]
 	if c == nil {
 		log.Println("first request from", ip)
-		counters[ip] = &counter{windowStart: now, count: 1}
-		return true
+		c = &counter{windowStart: now, count: 1}
+		counters[ip] = c
+		return snapshot(c, now, true)
 	}
 	if now.Sub(c.windowStart) >= window {
 		c.windowStart = now
 		c.count = 1
-		return true
+		return snapshot(c, now, true)
 	}
 	if c.count >= rateLimit {
-		return false
+		return snapshot(c, now, false)
 	}
 	c.count++
-	return true
+	return snapshot(c, now, true)
+}
+
+// ceilSeconds rounds a duration up to whole seconds, for Retry-After / Reset.
+func ceilSeconds(d time.Duration) int {
+	return int((d + time.Second - 1) / time.Second)
+}
+
+// The limit never changes, so format it once instead of every response.
+var rateLimitStr = strconv.Itoa(rateLimit)
+
+func setRateHeaders(w http.ResponseWriter, st limitState) {
+	h := w.Header()
+	h.Set("X-RateLimit-Limit", rateLimitStr)
+	h.Set("X-RateLimit-Remaining", strconv.Itoa(st.remaining))
+	h.Set("X-RateLimit-Reset", strconv.Itoa(ceilSeconds(st.resetIn)))
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
 	// Charged on arrival: a request refused later (503) still spends quota --
 	// we limit ask-rate, not serve-rate.
-	if !allow(host) {
+	st := allow(host)
+	setRateHeaders(w, st)
+	if !st.allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(ceilSeconds(st.resetIn)))
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
