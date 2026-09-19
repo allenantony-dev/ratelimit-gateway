@@ -7,7 +7,9 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +35,11 @@ func main() {
 		}
 		requests = n
 	}
+	proxies := os.Getenv("PROXIES")
+	if proxies == "" {
+		proxies = "http://127.0.0.1:8080"
+	}
+	targets := strings.Split(proxies, ",")
 
 	// No client-side pool limit, so all requests dial out at once.
 	tr := http.DefaultTransport.(*http.Transport).Clone()
@@ -49,17 +56,18 @@ func main() {
 	}
 	http.DefaultClient.Transport = tr
 
-	log.Printf("firing %d requests (from %q) at http://127.0.0.1:8080/hello", requests, *from)
+	log.Printf("firing %d requests (from %q) across %v", requests, *from, targets)
 
-	var served, gaveUp, failed, retries atomic.Int64
+	var served, gaveUp, failed, retries, firstPass atomic.Int64
 	var wg sync.WaitGroup
 
 	for i := range requests {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
+			url := targets[id%len(targets)] + "/hello"
 			for attempt := 1; ; attempt++ {
-				resp, err := http.Get("http://127.0.0.1:8080/hello")
+				resp, err := http.Get(url)
 				if err != nil {
 					failed.Add(1)
 					return
@@ -69,6 +77,9 @@ func main() {
 
 				if resp.StatusCode == http.StatusOK {
 					served.Add(1)
+					if attempt == 1 {
+						firstPass.Add(1)
+					}
 					return
 				}
 				if attempt >= maxAttempts {
@@ -84,8 +95,8 @@ func main() {
 	}
 
 	wg.Wait()
-	log.Printf("served=%d gave-up=%d failed=%d (retries=%d)",
-		served.Load(), gaveUp.Load(), failed.Load(), retries.Load())
+	log.Printf("served=%d (first-pass=%d) gave-up=%d failed=%d (retries=%d)",
+		served.Load(), firstPass.Load(), gaveUp.Load(), failed.Load(), retries.Load())
 }
 
 // backoff waits as the gateway asks: honor Retry-After (seconds) when present
