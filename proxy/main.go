@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"io"
 	"log"
 	"net"
@@ -111,11 +112,14 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	addr := flag.String("addr", ":8080", "listen address")
+	flag.Parse()
+
 	http.HandleFunc("/", proxyHandler)
 
-	log.Println("Starting proxy on :8080...")
+	log.Printf("Starting proxy on %s...", *addr)
 
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	if err := http.ListenAndServe(*addr, nil); err != nil {
 		log.Fatal(err)
 	}
 }
