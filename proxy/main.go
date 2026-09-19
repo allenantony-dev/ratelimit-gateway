@@ -15,16 +15,23 @@ const maxInFlight = 100
 var sem = make(chan struct{}, maxInFlight)
 
 const (
-	rateLimit = 10
-	window    = time.Minute
+	rateLimit      = 10          // sustained rate: tokens per window
+	window         = time.Minute
+	burst          = rateLimit   // bucket capacity
+	refillPerToken = window / rateLimit
 )
 
-// Per-client sliding window: timestamps of accepted requests within the last
-// window. Rejects aren't recorded, so each slice stays bounded at rateLimit.
+// Per-client token bucket, keyed by source IP. A new bucket starts full, so an
+// idle client may spend up to burst at once; refills continuously thereafter.
 var (
 	mu      sync.Mutex
-	clients = map[string][]time.Time{}
+	buckets = map[string]*bucket{}
 )
+
+type bucket struct {
+	tokens float64
+	last   time.Time
+}
 
 type limitState struct {
 	allowed   bool
@@ -37,26 +44,26 @@ func allow(ip string) limitState {
 	mu.Lock()
 	defer mu.Unlock()
 
-	times, seen := clients[ip]
+	b, seen := buckets[ip]
 	if !seen {
 		log.Println("first request from", ip)
+		b = &bucket{tokens: burst, last: now}
+		buckets[ip] = b
 	}
 
-	cutoff := now.Add(-window)
-	drop := 0
-	for drop < len(times) && times[drop].Before(cutoff) {
-		drop++
+	b.tokens += float64(now.Sub(b.last)) / float64(refillPerToken)
+	if b.tokens > burst {
+		b.tokens = burst
 	}
-	times = times[drop:]
+	b.last = now
 
-	if len(times) >= rateLimit {
-		clients[ip] = times
-		return limitState{allowed: false, remaining: 0, resetIn: window - now.Sub(times[0])}
+	allowed := b.tokens >= 1
+	if allowed {
+		b.tokens--
 	}
-
-	times = append(times, now)
-	clients[ip] = times
-	return limitState{allowed: true, remaining: rateLimit - len(times), resetIn: window - now.Sub(times[0])}
+	remaining := int(b.tokens)
+	resetIn := time.Duration((float64(remaining+1) - b.tokens) * float64(refillPerToken))
+	return limitState{allowed: allowed, remaining: remaining, resetIn: resetIn}
 }
 
 func ceilSeconds(d time.Duration) int {
@@ -75,7 +82,7 @@ func setRateHeaders(w http.ResponseWriter, st limitState) {
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	// Charged on arrival: a 503 later still spends quota (we limit ask-rate).
+	// Charged on arrival: a 503 later still spends a token (we limit ask-rate).
 	st := allow(host)
 	setRateHeaders(w, st)
 	if !st.allowed {
