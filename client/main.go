@@ -4,6 +4,7 @@ import (
 	"flag"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"strconv"
@@ -12,9 +13,13 @@ import (
 	"time"
 )
 
-// Concurrent requests to fire. Override with a positional arg after any flags,
-// e.g. `go run client/main.go 1000` or `go run client/main.go -from 127.0.0.2 1000`.
-const defaultRequests = 9500
+// Requests to fire. With retries, a large number would hammer for a very long
+// time (each client is capped at 10/min), so the default is small enough to
+// watch. Override with a positional arg after any flags, e.g. `client 50`.
+const defaultRequests = 25
+
+// Give up on a request after this many rejections.
+const maxAttempts = 20
 
 func main() {
 	from := flag.String("from", "", "source IP to dial from, e.g. 127.0.0.2 (default: OS chooses)")
@@ -44,39 +49,54 @@ func main() {
 	}
 	http.DefaultClient.Transport = tr
 
-	log.Printf("firing %d concurrent requests (from %q) at http://127.0.0.1:8080/hello", requests, *from)
+	log.Printf("firing %d requests (from %q) at http://127.0.0.1:8080/hello", requests, *from)
 
-	var ok, limited, overloaded, failed atomic.Int64
+	var served, gaveUp, failed, retries atomic.Int64
 	var wg sync.WaitGroup
 
-	for range requests {
+	for i := range requests {
 		wg.Add(1)
-
-		go func() {
+		go func(id int) {
 			defer wg.Done()
+			for attempt := 1; ; attempt++ {
+				resp, err := http.Get("http://127.0.0.1:8080/hello")
+				if err != nil {
+					failed.Add(1)
+					return
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
 
-			resp, err := http.Get("http://127.0.0.1:8080/hello")
-			if err != nil {
-				failed.Add(1)
-				return
+				if resp.StatusCode == http.StatusOK {
+					served.Add(1)
+					return
+				}
+				if attempt >= maxAttempts {
+					gaveUp.Add(1)
+					return
+				}
+				wait := backoff(resp)
+				retries.Add(1)
+				log.Printf("req %d: %d, retry in %s", id, resp.StatusCode, wait.Round(time.Millisecond))
+				time.Sleep(wait)
 			}
-			defer resp.Body.Close()
-			io.Copy(io.Discard, resp.Body)
-
-			switch resp.StatusCode {
-			case http.StatusOK:
-				ok.Add(1)
-			case http.StatusTooManyRequests:
-				limited.Add(1)
-			case http.StatusServiceUnavailable:
-				overloaded.Add(1)
-			default:
-				failed.Add(1)
-			}
-		}()
+		}(i)
 	}
 
 	wg.Wait()
-	log.Printf("ok=%d rate-limited(429)=%d overloaded(503)=%d failed=%d",
-		ok.Load(), limited.Load(), overloaded.Load(), failed.Load())
+	log.Printf("served=%d gave-up=%d failed=%d (retries=%d)",
+		served.Load(), gaveUp.Load(), failed.Load(), retries.Load())
+}
+
+// backoff waits as the gateway asks: honor Retry-After (seconds) when present
+// (429), else a short default (503). Jitter is added so retries don't all fire
+// at the same instant and stampede the next window.
+func backoff(resp *http.Response) time.Duration {
+	jitter := time.Duration(rand.Int63n(int64(time.Second)))
+	if s := resp.Header.Get("Retry-After"); s != "" {
+		if secs, err := strconv.Atoi(s); err == nil {
+			return time.Duration(secs)*time.Second + jitter
+		}
+	}
+	return time.Second + jitter
 }
