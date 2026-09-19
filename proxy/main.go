@@ -19,68 +19,51 @@ const (
 	window    = time.Minute
 )
 
-// Per-client fixed-window limit, keyed by source IP: at most rateLimit requests
-// per window. Simplest shape; its flaw is the boundary -- a client can send
-// rateLimit at the end of one window and rateLimit at the start of the next,
-// up to 2*rateLimit in a short span. A token bucket or sliding window smooths
-// that at the cost of more code.
-type counter struct {
-	windowStart time.Time
-	count       int
-}
-
+// Per-client sliding window: timestamps of accepted requests within the last
+// window. Rejects aren't recorded, so each slice stays bounded at rateLimit.
 var (
-	mu       sync.Mutex
-	counters = map[string]*counter{}
+	mu      sync.Mutex
+	clients = map[string][]time.Time{}
 )
 
-// limitState is a snapshot of one client's quota, taken under the lock so the
-// handler can set rate-limit headers without racing on the map.
 type limitState struct {
 	allowed   bool
 	remaining int
 	resetIn   time.Duration
 }
 
-func snapshot(c *counter, now time.Time, allowed bool) limitState {
-	remaining := rateLimit - c.count
-	if remaining < 0 {
-		remaining = 0
-	}
-	return limitState{allowed: allowed, remaining: remaining, resetIn: window - now.Sub(c.windowStart)}
-}
-
-// allow records one arrival from ip and returns the resulting quota snapshot.
 func allow(ip string) limitState {
 	now := time.Now()
 	mu.Lock()
 	defer mu.Unlock()
 
-	c := counters[ip]
-	if c == nil {
+	times, seen := clients[ip]
+	if !seen {
 		log.Println("first request from", ip)
-		c = &counter{windowStart: now, count: 1}
-		counters[ip] = c
-		return snapshot(c, now, true)
 	}
-	if now.Sub(c.windowStart) >= window {
-		c.windowStart = now
-		c.count = 1
-		return snapshot(c, now, true)
+
+	cutoff := now.Add(-window)
+	drop := 0
+	for drop < len(times) && times[drop].Before(cutoff) {
+		drop++
 	}
-	if c.count >= rateLimit {
-		return snapshot(c, now, false)
+	times = times[drop:]
+
+	if len(times) >= rateLimit {
+		clients[ip] = times
+		return limitState{allowed: false, remaining: 0, resetIn: window - now.Sub(times[0])}
 	}
-	c.count++
-	return snapshot(c, now, true)
+
+	times = append(times, now)
+	clients[ip] = times
+	return limitState{allowed: true, remaining: rateLimit - len(times), resetIn: window - now.Sub(times[0])}
 }
 
-// ceilSeconds rounds a duration up to whole seconds, for Retry-After / Reset.
 func ceilSeconds(d time.Duration) int {
 	return int((d + time.Second - 1) / time.Second)
 }
 
-// The limit never changes, so format it once instead of every response.
+// Constant limit, formatted once.
 var rateLimitStr = strconv.Itoa(rateLimit)
 
 func setRateHeaders(w http.ResponseWriter, st limitState) {
@@ -92,8 +75,7 @@ func setRateHeaders(w http.ResponseWriter, st limitState) {
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	// Charged on arrival: a request refused later (503) still spends quota --
-	// we limit ask-rate, not serve-rate.
+	// Charged on arrival: a 503 later still spends quota (we limit ask-rate).
 	st := allow(host)
 	setRateHeaders(w, st)
 	if !st.allowed {
@@ -102,7 +84,6 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Non-blocking acquire: reject when all slots are taken, don't queue.
 	select {
 	case sem <- struct{}{}:
 		defer func() { <-sem }()
