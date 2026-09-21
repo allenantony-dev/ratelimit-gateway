@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -28,6 +29,7 @@ var (
 	ratePerSec   = float64(rateLimit) / window.Seconds()
 	rateLimitStr = strconv.Itoa(rateLimit)
 	rdb          *redis.Client
+	redisDown    atomic.Bool
 )
 
 // One atomic step in Redis: refill from Redis's own clock, take a token if one
@@ -73,7 +75,13 @@ func allow(ip string) (limitState, bool) {
 
 	res, err := bucketScript.Run(ctx, rdb, []string{"rl:" + ip}, ratePerSec, burst).Result()
 	if err != nil {
+		if redisDown.CompareAndSwap(false, true) {
+			log.Println("redis unavailable, failing open:", err)
+		}
 		return limitState{allowed: true}, false
+	}
+	if redisDown.CompareAndSwap(true, false) {
+		log.Println("redis recovered")
 	}
 	arr, ok := res.([]any)
 	if !ok || len(arr) < 3 {
@@ -124,7 +132,15 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
+// discardLogger silences go-redis's per-error internal logging; we report Redis
+// state changes ourselves, once per transition.
+type discardLogger struct{}
+
+func (discardLogger) Printf(context.Context, string, ...any) {}
+
 func main() {
+	redis.SetLogger(discardLogger{})
+
 	addr := flag.String("addr", ":8080", "listen address")
 	flag.Parse()
 
