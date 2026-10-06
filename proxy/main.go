@@ -124,13 +124,24 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := http.Get("http://127.0.0.1:9000" + r.URL.Path)
+	outReq, err := http.NewRequest(r.Method, "http://127.0.0.1:9000"+r.URL.RequestURI(), r.Body)
+	if err != nil {
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return
+	}
+	outReq.Header = r.Header.Clone()
+	outReq.ContentLength = r.ContentLength
+
+	resp, err := http.DefaultClient.Do(outReq)
 	if err != nil {
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
+	for k, v := range resp.Header {
+		w.Header()[k] = v
+	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
