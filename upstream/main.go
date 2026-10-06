@@ -2,14 +2,18 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net/http"
-	"time"
 )
 
 func helloHandler(w http.ResponseWriter, r *http.Request) {
-	time.Sleep(10 * time.Second) // slow upstream so requests pile up in the proxy
-	fmt.Fprintln(w, "Hello, World!")
+	body, _ := io.ReadAll(r.Body)
+	fmt.Fprintf(w, "%s %s\n", r.Method, r.URL)
+	for k, v := range r.Header {
+		fmt.Fprintf(w, "%s: %v\n", k, v)
+	}
+	fmt.Fprintf(w, "\nbody: %q\n", body)
 }
 
 func main() {
