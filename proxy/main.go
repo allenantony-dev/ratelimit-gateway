@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"io"
 	"log"
@@ -16,6 +17,7 @@ import (
 )
 
 const maxInFlight = 100
+const upstreamTimeout = 5 * time.Second
 
 var sem = make(chan struct{}, maxInFlight)
 
@@ -124,7 +126,11 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	outReq, err := http.NewRequest(r.Method, "http://127.0.0.1:9000"+r.URL.RequestURI(), r.Body)
+	// Bound the upstream call and cancel it if the client hangs up (r.Context()
+	// is cancelled on disconnect) -- either way the held slot is released.
+	ctx, cancel := context.WithTimeout(r.Context(), upstreamTimeout)
+	defer cancel()
+	outReq, err := http.NewRequestWithContext(ctx, r.Method, "http://127.0.0.1:9000"+r.URL.RequestURI(), r.Body)
 	if err != nil {
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
@@ -134,7 +140,14 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := http.DefaultClient.Do(outReq)
 	if err != nil {
-		http.Error(w, "upstream error", http.StatusBadGateway)
+		switch {
+		case errors.Is(err, context.Canceled):
+			return // client hung up -- nothing to write a response to
+		case errors.Is(err, context.DeadlineExceeded):
+			http.Error(w, "upstream timeout", http.StatusGatewayTimeout)
+		default:
+			http.Error(w, "upstream error", http.StatusBadGateway)
+		}
 		return
 	}
 	defer resp.Body.Close()
