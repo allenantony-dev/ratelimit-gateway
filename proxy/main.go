@@ -7,14 +7,16 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"maps"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path"
 	"strconv"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -78,14 +80,14 @@ func watchConfig(file string) {
 	for range t.C {
 		m, err := loadConfig(file)
 		if err != nil {
-			log.Printf("config reload failed, keeping last good config: %v", err)
+			slog.Warn("config reload failed, keeping last good config", "err", err)
 			continue
 		}
 		if maps.Equal(*routeLimits.Load(), m) {
 			continue
 		}
 		routeLimits.Store(&m)
-		log.Printf("config reloaded: %v", m)
+		slog.Info("config reloaded", "limits", m)
 	}
 }
 
@@ -145,7 +147,7 @@ func allow(route, ip string, limit int) (limitState, bool) {
 	res, err := bucketScript.Run(ctx, rdb, []string{"rl:" + route + ":" + ip}, rate, limit).Result()
 	if err != nil {
 		if redisDown.CompareAndSwap(false, true) {
-			log.Println("redis unavailable, failing open:", err)
+			slog.Warn("redis unavailable, failing open", "err", err)
 		}
 		// Fail open: only per-client fairness rides on Redis; the concurrency cap
 		// (503) still protects the upstream without it, so a Redis outage costs
@@ -153,7 +155,7 @@ func allow(route, ip string, limit int) (limitState, bool) {
 		return limitState{allowed: true}, false
 	}
 	if redisDown.CompareAndSwap(true, false) {
-		log.Println("redis recovered")
+		slog.Info("redis recovered")
 	}
 	arr, ok := res.([]any)
 	if !ok || len(arr) < 3 {
@@ -180,6 +182,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	if ok {
 		setRateHeaders(w, st, limit)
 		if !st.allowed {
+			// Info, not Error: a 429 is routine and scales with offending traffic,
+			// so it stays below the upstream-failure logs instead of flooding them.
+			slog.Info("rate limited", "route", route, "client", host)
 			w.Header().Set("Retry-After", strconv.Itoa(st.resetSec))
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
@@ -190,6 +195,9 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	case sem <- struct{}{}:
 		defer func() { <-sem }()
 	default:
+		// Warn, above the 429: a 503 means the global concurrency cap is saturated
+		// -- a whole-gateway health signal, not one client overspending.
+		slog.Warn("overloaded, concurrency cap saturated", "route", route, "client", host)
 		http.Error(w, "overloaded", http.StatusServiceUnavailable)
 		return
 	}
@@ -212,8 +220,10 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, context.Canceled):
 			return // client hung up -- nothing to write a response to
 		case errors.Is(err, context.DeadlineExceeded):
+			slog.Error("upstream timeout", "route", route, "client", host)
 			http.Error(w, "upstream timeout", http.StatusGatewayTimeout)
 		default:
+			slog.Error("upstream error", "route", route, "client", host, "err", err)
 			http.Error(w, "upstream error", http.StatusBadGateway)
 		}
 		return
@@ -242,7 +252,8 @@ func main() {
 
 	cfg, err := loadConfig(*configFile)
 	if err != nil {
-		log.Fatalf("config %s: %v", *configFile, err)
+		slog.Error("load config", "file", *configFile, "err", err)
+		os.Exit(1)
 	}
 	routeLimits.Store(&cfg)
 	go watchConfig(*configFile)
@@ -255,9 +266,32 @@ func main() {
 
 	http.HandleFunc("/", proxyHandler)
 
-	log.Printf("Starting proxy on %s (redis %s, config %s)...", *addr, redisAddr, *configFile)
+	// Timeouts bound a slow client that dribbles a request or drains a response;
+	// without ReadHeaderTimeout a stalled header write holds a connection forever.
+	srv := &http.Server{
+		Addr:              *addr,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      15 * time.Second,
+	}
 
-	if err := http.ListenAndServe(*addr, nil); err != nil {
-		log.Fatal(err)
+	go func() {
+		slog.Info("starting proxy", "addr", *addr, "redis", redisAddr, "config", *configFile)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("listen", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Stop accepting on a signal and let in-flight proxied responses finish
+	// before exiting, instead of killing them mid-write.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	<-ctx.Done()
+
+	slog.Info("shutting down")
+	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutCtx); err != nil {
+		slog.Error("shutdown", "err", err)
 	}
 }
