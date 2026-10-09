@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -23,29 +26,75 @@ const upstreamTimeout = 5 * time.Second
 var sem = make(chan struct{}, maxInFlight)
 
 const (
-	window       = time.Minute
-	defaultLimit = 10
+	window         = time.Minute
+	defaultLimit   = 10
+	reloadInterval = 10 * time.Second
 )
 
-// Requests allowed per window, by exact route path. A path matching nothing
-// gets defaultLimit, which also covers routes added without a config entry.
-// /login is strict (password guessing), /search loose.
-var routeLimits = map[string]int{
-	"/login":  5,
-	"/search": 60,
-}
+// Per-route request limits per window, loaded from a JSON file ({"/login": 5}).
+// A path matching nothing gets defaultLimit. The map is swapped wholesale on
+// reload and never mutated after publish, so readers load it lock-free.
+var routeLimits atomic.Pointer[map[string]int]
 
 var (
 	rdb       *redis.Client
 	redisDown atomic.Bool
 )
 
+func loadConfig(file string) (map[string]int, error) {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	var raw map[string]int
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	// Clean keys so they match the cleaned path limitFor looks up; an uncleaned
+	// key like "/search/" would otherwise be a dead entry that never matches.
+	m := make(map[string]int, len(raw))
+	for route, n := range raw {
+		if n <= 0 {
+			return nil, fmt.Errorf("route %q: limit must be positive, got %d", route, n)
+		}
+		route = path.Clean(route)
+		if route[0] != '/' {
+			return nil, fmt.Errorf("route %q must start with /", route)
+		}
+		if _, dup := m[route]; dup {
+			return nil, fmt.Errorf("route %q appears twice after cleaning", route)
+		}
+		m[route] = n
+	}
+	return m, nil
+}
+
+// watchConfig re-reads the file every reloadInterval and swaps the live map in
+// one atomic step. A bad file keeps the last good config (fail soft); startup
+// is where a bad file fails hard instead.
+func watchConfig(file string) {
+	t := time.NewTicker(reloadInterval)
+	defer t.Stop()
+	for range t.C {
+		m, err := loadConfig(file)
+		if err != nil {
+			log.Printf("config reload failed, keeping last good config: %v", err)
+			continue
+		}
+		if maps.Equal(*routeLimits.Load(), m) {
+			continue
+		}
+		routeLimits.Store(&m)
+		log.Printf("config reloaded: %v", m)
+	}
+}
+
 // limitFor returns the matched route key (for the Redis bucket) and its limit.
 // The path is cleaned first so /x/../login and //login resolve to /login, the
 // same route the backend sees -- otherwise they'd slip past the strict limit.
 func limitFor(p string) (string, int) {
 	p = path.Clean(p)
-	if n, ok := routeLimits[p]; ok {
+	if n, ok := (*routeLimits.Load())[p]; ok {
 		return p, n
 	}
 	return "default", defaultLimit
@@ -188,7 +237,15 @@ func main() {
 	redis.SetLogger(discardLogger{})
 
 	addr := flag.String("addr", ":8080", "listen address")
+	configFile := flag.String("config", "config.json", "route limits file (JSON)")
 	flag.Parse()
+
+	cfg, err := loadConfig(*configFile)
+	if err != nil {
+		log.Fatalf("config %s: %v", *configFile, err)
+	}
+	routeLimits.Store(&cfg)
+	go watchConfig(*configFile)
 
 	redisAddr := os.Getenv("REDIS_ADDR")
 	if redisAddr == "" {
@@ -198,7 +255,7 @@ func main() {
 
 	http.HandleFunc("/", proxyHandler)
 
-	log.Printf("Starting proxy on %s (redis %s)...", *addr, redisAddr)
+	log.Printf("Starting proxy on %s (redis %s, config %s)...", *addr, redisAddr, *configFile)
 
 	if err := http.ListenAndServe(*addr, nil); err != nil {
 		log.Fatal(err)
