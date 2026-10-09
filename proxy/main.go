@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -22,17 +23,33 @@ const upstreamTimeout = 5 * time.Second
 var sem = make(chan struct{}, maxInFlight)
 
 const (
-	rateLimit = 10
-	window    = time.Minute
-	burst     = rateLimit
+	window       = time.Minute
+	defaultLimit = 10
 )
 
+// Requests allowed per window, by exact route path. A path matching nothing
+// gets defaultLimit, which also covers routes added without a config entry.
+// /login is strict (password guessing), /search loose.
+var routeLimits = map[string]int{
+	"/login":  5,
+	"/search": 60,
+}
+
 var (
-	ratePerSec   = float64(rateLimit) / window.Seconds()
-	rateLimitStr = strconv.Itoa(rateLimit)
-	rdb          *redis.Client
-	redisDown    atomic.Bool
+	rdb       *redis.Client
+	redisDown atomic.Bool
 )
+
+// limitFor returns the matched route key (for the Redis bucket) and its limit.
+// The path is cleaned first so /x/../login and //login resolve to /login, the
+// same route the backend sees -- otherwise they'd slip past the strict limit.
+func limitFor(p string) (string, int) {
+	p = path.Clean(p)
+	if n, ok := routeLimits[p]; ok {
+		return p, n
+	}
+	return "default", defaultLimit
+}
 
 // One atomic step in Redis: refill from Redis's own clock, take a token if one
 // is free, persist, and expire an idle bucket. Returns {allowed, remaining,
@@ -71,11 +88,12 @@ type limitState struct {
 
 // allow runs the bucket script for ip. The bool is false when Redis didn't
 // answer -- callers fail open (admit, no headers).
-func allow(ip string) (limitState, bool) {
+func allow(route, ip string, limit int) (limitState, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	res, err := bucketScript.Run(ctx, rdb, []string{"rl:" + ip}, ratePerSec, burst).Result()
+	rate := float64(limit) / window.Seconds()
+	res, err := bucketScript.Run(ctx, rdb, []string{"rl:" + route + ":" + ip}, rate, limit).Result()
 	if err != nil {
 		if redisDown.CompareAndSwap(false, true) {
 			log.Println("redis unavailable, failing open:", err)
@@ -98,19 +116,20 @@ func allow(ip string) (limitState, bool) {
 	return limitState{allowed: allowed == 1, remaining: int(remaining), resetSec: int(resetSec)}, true
 }
 
-func setRateHeaders(w http.ResponseWriter, st limitState) {
+func setRateHeaders(w http.ResponseWriter, st limitState, limit int) {
 	h := w.Header()
-	h.Set("X-RateLimit-Limit", rateLimitStr)
+	h.Set("X-RateLimit-Limit", strconv.Itoa(limit))
 	h.Set("X-RateLimit-Remaining", strconv.Itoa(st.remaining))
 	h.Set("X-RateLimit-Reset", strconv.Itoa(st.resetSec))
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	route, limit := limitFor(r.URL.Path)
 	// Charged on arrival: a 503 later still spends a token (we limit ask-rate).
-	st, ok := allow(host)
+	st, ok := allow(route, host, limit)
 	if ok {
-		setRateHeaders(w, st)
+		setRateHeaders(w, st, limit)
 		if !st.allowed {
 			w.Header().Set("Retry-After", strconv.Itoa(st.resetSec))
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
